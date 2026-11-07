@@ -8,292 +8,500 @@ import requests
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 
-# ---------------- KONFIGURASAUN ----------------
-DB_PATH = "crypto_data.db"
-API_BASE = "https://api.binance.com/api/v3"
 
-KOIN = {
-    "Bitcoin": "BTCUSDT",
-    "Ethereum": "ETHUSDT",
-    "BNB": "BNBUSDT",
-    "Solana": "SOLUSDT",
-}
+# =========================================================
+# 1. KONFIGURASAUN SISTEMA
+# =========================================================
 
 st.set_page_config(
-    page_title="Analiza Cryptocurrency Real-Time",
+    page_title="Cryptocurrency Real-Time Analytics",
     page_icon="₿",
-    layout="wide",
+    layout="wide"
 )
 
-# ---------------- DATABASE ----------------
+DB_PATH = "crypto_data.db"
+
+API_BASE = "https://api.coinpaprika.com/v1"
+
+COINS = {
+    "Bitcoin": "btc-bitcoin",
+    "Ethereum": "eth-ethereum",
+    "BNB": "bnb-binance-coin",
+    "Solana": "sol-solana"
+}
+
+
+# =========================================================
+# 2. ESTILU DASHBOARD
+# =========================================================
+
+st.markdown("""
+<style>
+    .main {
+        background-color: #f7f9fc;
+    }
+
+    .block-container {
+        padding-top: 1.5rem;
+    }
+
+    div[data-testid="stMetric"] {
+        background-color: white;
+        border: 1px solid #e6eaf0;
+        padding: 15px;
+        border-radius: 12px;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+
+# =========================================================
+# 3. DATABASE SQLITE
+# =========================================================
+
 def init_db():
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS market_data (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp TEXT NOT NULL,
-                coin TEXT NOT NULL,
-                symbol TEXT NOT NULL,
-                price REAL NOT NULL,
-                price_change_percent REAL,
-                volume REAL,
-                quote_volume REAL,
-                high_24h REAL,
-                low_24h REAL
-            )
-        """)
-        conn.commit()
+    conn = sqlite3.connect(DB_PATH)
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS market_data (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT,
+            coin TEXT,
+            symbol TEXT,
+            price REAL,
+            price_change_percent REAL,
+            volume REAL
+        )
+    """)
+
+    conn.commit()
+    conn.close()
 
 
-# Rai dadus merkadu iha database
 def save_rows(rows):
     if not rows:
         return
 
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.executemany("""
-            INSERT INTO market_data
-            (timestamp, coin, symbol, price, price_change_percent,
-             volume, quote_volume, high_24h, low_24h)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, rows)
-        conn.commit()
+    conn = sqlite3.connect(DB_PATH)
 
-
-# Foti istória dadus husi database
-def load_history(limit=2000):
-    with sqlite3.connect(DB_PATH) as conn:
-        df = pd.read_sql_query(
-            "SELECT * FROM market_data ORDER BY id DESC LIMIT ?",
-            conn,
-            params=(limit,),
+    conn.executemany("""
+        INSERT INTO market_data (
+            timestamp,
+            coin,
+            symbol,
+            price,
+            price_change_percent,
+            volume
         )
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, [
+        (
+            row["timestamp"],
+            row["coin"],
+            row["symbol"],
+            row["price"],
+            row["price_change_percent"],
+            row["volume"]
+        )
+        for row in rows
+    ])
+
+    conn.commit()
+    conn.close()
+
+
+def load_history(limit=2000):
+    conn = sqlite3.connect(DB_PATH)
+
+    df = pd.read_sql_query(
+        """
+        SELECT *
+        FROM market_data
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        conn,
+        params=(limit,)
+    )
+
+    conn.close()
 
     if not df.empty:
-        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+        df["timestamp"] = pd.to_datetime(
+            df["timestamp"],
+            errors="coerce",
+            utc=True
+        )
+
         df = df.sort_values("timestamp")
 
     return df
 
 
-# ---------------- HALO REKOLHA DADUS ----------------
-@st.cache_data(ttl=4, show_spinner=False)
+# =========================================================
+# 4. FET DADUS HUSI COINPAPRIKA API
+# =========================================================
+
+@st.cache_data(ttl=300, show_spinner=False)
 def fetch_market_data():
+
     results = []
     errors = []
+
     timestamp = datetime.now(timezone.utc).isoformat()
 
-    for coin, symbol in KOIN.items():
-        try:
-            response = requests.get(
-                f"{API_BASE}/ticker/24hr",
-                params={"symbol": symbol},
-                timeout=10,
-            )
+    try:
+        response = requests.get(
+            f"{API_BASE}/tickers",
+            params={"quotes": "USD"},
+            headers={
+                "Accept": "application/json",
+                "User-Agent": "CryptoRealTimeAnalytics/1.0"
+            },
+            timeout=30
+        )
 
-            response.raise_for_status()
-            item = response.json()
+        response.raise_for_status()
+
+        data = response.json()
+
+        data_by_id = {
+            item["id"]: item
+            for item in data
+        }
+
+        for coin, coin_id in COINS.items():
+
+            item = data_by_id.get(coin_id)
+
+            if item is None:
+                errors.append(
+                    f"Dadus {coin} la hetan iha API."
+                )
+                continue
+
+            usd = item.get("quotes", {}).get("USD", {})
+
+            price = usd.get("price")
+
+            if price is None:
+                errors.append(
+                    f"Presu {coin} la disponivel."
+                )
+                continue
 
             results.append({
                 "timestamp": timestamp,
                 "coin": coin,
-                "symbol": symbol,
-                "price": float(item["lastPrice"]),
-                "price_change_percent": float(item["priceChangePercent"]),
-                "volume": float(item["volume"]),
-                "quote_volume": float(item["quoteVolume"]),
-                "high_24h": float(item["highPrice"]),
-                "low_24h": float(item["lowPrice"]),
+                "symbol": item.get("symbol", ""),
+                "price": float(price),
+                "price_change_percent": float(
+                    usd.get("percent_change_24h") or 0
+                ),
+                "volume": float(
+                    usd.get("volume_24h") or 0
+                )
             })
 
-        except (requests.RequestException, KeyError, ValueError) as exc:
-            errors.append(f"{symbol}: {exc}")
+    except requests.exceptions.Timeout:
+        errors.append(
+            "API timeout. Favor koko fali."
+        )
+
+    except requests.exceptions.HTTPError as exc:
+        errors.append(
+            f"Erro HTTP husi API: {exc}"
+        )
+
+    except requests.exceptions.RequestException as exc:
+        errors.append(
+            f"Problema koneksaun API: {exc}"
+        )
+
+    except (KeyError, ValueError, TypeError) as exc:
+        errors.append(
+            f"Erro prosesamentu dadus: {exc}"
+        )
 
     return results, errors
 
 
-# ---------------- DASHBOARD PRINCIPAL ----------------
+# =========================================================
+# 5. FORMATU VALOR
+# =========================================================
+
+def format_price(value):
+    if pd.isna(value):
+        return "N/A"
+
+    if value < 1:
+        return f"${value:,.6f}"
+
+    return f"${value:,.2f}"
+
+
+# =========================================================
+# 6. INICIALIZA SISTEMA
+# =========================================================
+
 init_db()
 
-st.title("₿ SISTEMA ANALIZA CRYPTOCURRENCY REAL-TIME")
+st.title("₿ Cryptocurrency Real-Time Analytics")
 
 st.caption(
-    "Monitorizasaun merkadu Cryptocurrency iha tempu real "
-    "uza Binance API | Atualizasaun kada segundu 5"
+    "Sistema monitorizasaun presu, volume no mudansa merkadu cryptocurrency."
 )
 
-# Atualiza dashboard automaticamente kada segundu 5
-st_autorefresh(interval=5000, key="crypto_refresh")
-
-with st.spinner("Hasai dadus merkadu hela..."):
-    market, errors = fetch_market_data()
+st.markdown("---")
 
 
-# Rai dadus foun ba database
-if market:
-    rows = [
-        (
-            item["timestamp"], item["coin"], item["symbol"],
-            item["price"], item["price_change_percent"],
-            item["volume"], item["quote_volume"],
-            item["high_24h"], item["low_24h"],
-        )
-        for item in market
-    ]
+# =========================================================
+# 7. SIDEBAR
+# =========================================================
 
-    save_rows(rows)
+st.sidebar.title("⚙️ Kontrolu Dashboard")
 
-
-# Hatudu mensajen erro
-if errors:
-    for error in errors:
-        st.warning(f"La konsege foti dadus: {error}")
-
-
-if not market:
-    st.error(
-        "Dadus merkadu seidauk konsege hetan. "
-        "Favor haree koneksaun internet ka koko fali."
-    )
-    st.stop()
-
-
-# ---------------- REZUMU PRESU ----------------
-st.subheader("Rezumu Presu Cryptocurrency")
-
-cols = st.columns(len(market))
-
-for col, item in zip(cols, market):
-    change = item["price_change_percent"]
-
-    col.metric(
-        label=f'{item["coin"]} ({item["symbol"]})',
-        value=f'${item["price"]:,.4f}',
-        delta=f"{change:+.2f}% (oras 24)",
-    )
-
-
-st.divider()
-
-
-# ---------------- INFORMASAUN SISTEMA ----------------
-left, right = st.columns([2, 1])
-
-with left:
-    st.subheader("Grafiku Mudansa Presu")
-
-    selected_coin = st.selectbox(
-        "Hili Cryptocurrency",
-        list(KOIN.keys())
-    )
-
-with right:
-    st.subheader("Informasaun Sistema")
-
-    st.write(
-        f"**Oras Atualizasaun:** "
-        f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-    )
-
-    st.write("**Intervalu Atualizasaun:** Segundu 5")
-    st.write(f"**Total Ativu ne'ebé Monitoriza:** {len(KOIN)}")
-
-
-# ---------------- GRAFIKU ISTÓRIA PRESU ----------------
-history = load_history()
-
-coin_history = (
-    history[history["coin"] == selected_coin]
-    if not history.empty
-    else pd.DataFrame()
+selected_coin = st.sidebar.selectbox(
+    "Hili Cryptocurrency",
+    list(COINS.keys())
 )
 
-if not coin_history.empty:
+history_limit = st.sidebar.selectbox(
+    "Kuidadu dadus historiku",
+    [100, 500, 1000, 2000, 5000],
+    index=3
+)
 
-    chart = px.line(
-        coin_history,
-        x="timestamp",
-        y="price",
-        title=f"Istória Presu {selected_coin}",
-        labels={
-            "timestamp": "Oras",
-            "price": "Presu (USDT)",
-        },
+st.sidebar.markdown("---")
+
+st.sidebar.info(
+    "Dashboard atualiza kada 5 minutus."
+)
+
+if st.sidebar.button("🔄 Atualiza Dadus Agora"):
+    fetch_market_data.clear()
+    st.rerun()
+
+
+# =========================================================
+# 8. AUTO REFRESH
+# =========================================================
+
+st_autorefresh(
+    interval=300000,
+    key="crypto_refresh"
+)
+
+
+# =========================================================
+# 9. FET DADUS MERKADU
+# =========================================================
+
+with st.spinner("Hela foti dadus cryptocurrency..."):
+
+    market_rows, api_errors = fetch_market_data()
+
+    if market_rows:
+        save_rows(market_rows)
+
+df = load_history()
+
+
+# =========================================================
+# 10. STATUS API
+# =========================================================
+
+if market_rows:
+    st.success(
+        f"API konekta ho susesu. Dadus {len(market_rows)} hetan."
     )
-
-    chart.update_layout(hovermode="x unified")
-
-    st.plotly_chart(chart, use_container_width=True)
-
 else:
-    st.info(
-        "Dadus istória seidauk sufisiente. "
-        "Grafiku sei mosu depois atualizasaun balun."
+    st.warning(
+        "La konsege hetan dadus foun. Sistema sei buka dadus historiku."
     )
 
-
-# ---------------- GRAFIKU VOLUME NEGOSIU ----------------
-st.subheader("Volume Negosiu Durante Oras 24")
-
-volume_df = pd.DataFrame(market)
-
-volume_chart = px.bar(
-    volume_df,
-    x="coin",
-    y="quote_volume",
-    color="coin",
-    labels={
-        "coin": "Cryptocurrency",
-        "quote_volume": "Volume Negosiu (USDT)",
-    },
-)
-
-st.plotly_chart(volume_chart, use_container_width=True)
+for error in api_errors:
+    st.warning(error)
 
 
-# ---------------- TABELA DADUS MERKADU ----------------
-st.subheader("Dadus Merkadu Foun")
+# =========================================================
+# 11. DASHBOARD PRINCIPAL
+# =========================================================
 
-table_df = pd.DataFrame(market)[
-    [
-        "coin",
-        "symbol",
-        "price",
-        "price_change_percent",
-        "volume",
-        "quote_volume",
-        "high_24h",
-        "low_24h",
+if not df.empty:
+
+    # Dadus ikus ba cryptocurrency ida-idak
+    latest = (
+        df.sort_values("timestamp")
+        .groupby("coin")
+        .tail(1)
+        .copy()
+    )
+
+    latest = latest.set_index("coin")
+
+    # -----------------------------------------------------
+    # KPI METRICS
+    # -----------------------------------------------------
+
+    st.subheader("📊 Rezumu Merkadu")
+
+    metric_columns = st.columns(4)
+
+    for column, coin in zip(metric_columns, COINS.keys()):
+
+        if coin in latest.index:
+
+            row = latest.loc[coin]
+
+            column.metric(
+                label=f"{coin} ({row['symbol']})",
+                value=format_price(row["price"]),
+                delta=f"{row['price_change_percent']:.2f}%"
+            )
+
+        else:
+
+            column.metric(
+                label=coin,
+                value="N/A"
+            )
+
+    st.markdown("---")
+
+    # -----------------------------------------------------
+    # GRAFIKU PRESU
+    # -----------------------------------------------------
+
+    st.subheader(
+        f"📈 Analizaun Presu - {selected_coin}"
+    )
+
+    coin_history = df[
+        df["coin"] == selected_coin
+    ].copy()
+
+    if not coin_history.empty:
+
+        fig_price = px.line(
+            coin_history,
+            x="timestamp",
+            y="price",
+            title=f"Historiku Presu {selected_coin}",
+            labels={
+                "timestamp": "Tempu",
+                "price": "Presu USD"
+            },
+            markers=True
+        )
+
+        fig_price.update_layout(
+            hovermode="x unified",
+            xaxis_title="Tempu",
+            yaxis_title="Presu USD"
+        )
+
+        st.plotly_chart(
+            fig_price,
+            use_container_width=True
+        )
+
+    else:
+
+        st.info(
+            "Seidauk iha dadus historiku ba cryptocurrency ida-ne'e."
+        )
+
+    st.markdown("---")
+
+    # -----------------------------------------------------
+    # GRAFIKU VOLUME 24H
+    # -----------------------------------------------------
+
+    st.subheader("📊 Komparasaun Volume 24H")
+
+    latest_volume = (
+        df.sort_values("timestamp")
+        .groupby("coin")
+        .tail(1)
+        .copy()
+    )
+
+    fig_volume = px.bar(
+        latest_volume,
+        x="coin",
+        y="volume",
+        color="coin",
+        text="volume",
+        title="Volume Transasaun Cryptocurrency 24H",
+        labels={
+            "coin": "Cryptocurrency",
+            "volume": "Volume USD"
+        }
+    )
+
+    fig_volume.update_traces(
+        texttemplate="$%{y:.3s}",
+        textposition="outside"
+    )
+
+    fig_volume.update_layout(
+        showlegend=False,
+        xaxis_title="Cryptocurrency",
+        yaxis_title="Volume USD"
+    )
+
+    st.plotly_chart(
+        fig_volume,
+        use_container_width=True
+    )
+
+    st.markdown("---")
+
+    # -----------------------------------------------------
+    # TABELA DADUS MERKADU
+    # -----------------------------------------------------
+
+    st.subheader("📋 Dadus Merkadu Mais Foun")
+
+    display_df = latest_volume[
+        [
+            "coin",
+            "symbol",
+            "price",
+            "price_change_percent",
+            "volume",
+            "timestamp"
+        ]
+    ].copy()
+
+    display_df.columns = [
+        "Cryptocurrency",
+        "Symbol",
+        "Presu USD",
+        "Mudansa 24H (%)",
+        "Volume 24H USD",
+        "Data no Oras"
     ]
-].rename(columns={
-    "coin": "Cryptocurrency",
-    "symbol": "Símbolu",
-    "price": "Presu (USDT)",
-    "price_change_percent": "Mudansa Presu Oras 24 (%)",
-    "volume": "Volume Ativu",
-    "quote_volume": "Volume Negosiu USDT",
-    "high_24h": "Presu Sa'e Liña As",
-    "low_24h": "Presu Tun Liña As",
-})
-
-st.dataframe(
-    table_df,
-    use_container_width=True,
-    hide_index=True
-)
-
-
-# ---------------- ISTÓRIA DADUS NE'EBÉ RAI ----------------
-st.subheader("Istória Dadus ne'ebé Rai Ona")
-
-st.caption(
-    f"Total dadus istória ne'ebé hatudu: {len(history):,} liña"
-)
-
-if not history.empty:
 
     st.dataframe(
-        history.tail(20).sort_values(
+        display_df,
+        use_container_width=True,
+        hide_index=True
+    )
+
+    st.markdown("---")
+
+    # -----------------------------------------------------
+    # HISTORIKU DADUS
+    # -----------------------------------------------------
+
+    st.subheader("🗃️ Historiku Dadus")
+
+    history_df = load_history(history_limit)
+
+    st.dataframe(
+        history_df.sort_values(
             "timestamp",
             ascending=False
         ),
@@ -301,20 +509,69 @@ if not history.empty:
         hide_index=True
     )
 
-    # Download istória dadus iha formatu CSV
-    csv = history.to_csv(index=False).encode("utf-8")
+    # -----------------------------------------------------
+    # DOWNLOAD CSV
+    # -----------------------------------------------------
+
+    csv_data = history_df.to_csv(
+        index=False
+    ).encode("utf-8")
 
     st.download_button(
-        "Download Istória Dadus (CSV)",
-        csv,
-        "istoria_crypto.csv",
-        "text/csv"
+        label="⬇️ Download Dadus CSV",
+        data=csv_data,
+        file_name="crypto_market_history.csv",
+        mime="text/csv"
+    )
+
+    st.markdown("---")
+
+    # -----------------------------------------------------
+    # INFORMASAUN SISTEMA
+    # -----------------------------------------------------
+
+    st.subheader("ℹ️ Informasaun Sistema")
+
+    col1, col2, col3 = st.columns(3)
+
+    col1.metric(
+        "Total Dadus",
+        f"{len(df):,}"
+    )
+
+    col2.metric(
+        "Total Cryptocurrency",
+        f"{df['coin'].nunique()}"
+    )
+
+    last_update = df["timestamp"].max()
+
+    col3.metric(
+        "Atualizasaun Ikus",
+        last_update.strftime("%Y-%m-%d %H:%M:%S UTC")
+        if pd.notna(last_update)
+        else "N/A"
+    )
+
+else:
+
+    st.error(
+        "Seidauk iha dadus. Favor verifica koneksaun internet no API."
     )
 
 
-# ---------------- INFORMASAUN FONTE DADUS ----------------
+# =========================================================
+# 12. FOOTER
+# =========================================================
+
+st.markdown("---")
+
 st.caption(
-    "Fonte Dadus: Binance Public Market API. "
-    "Dadus hirak ne'e uza ba monitorizasaun no análize, "
-    "la'ós konsellu investimentu."
+    "Cryptocurrency Real-Time Analytics | "
+    "Python + Streamlit + CoinPaprika API + SQLite"
+)
+
+st.caption(
+    "Dadus CoinPaprika atualiza aproximadamente kada 5 minutus. "
+    "Dashboard ne'e la'ós sistema trading."
 )
